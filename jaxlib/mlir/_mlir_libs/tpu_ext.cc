@@ -51,6 +51,7 @@ limitations under the License.
 #include "pybind11/numpy.h"
 #include "pybind11/pytypes.h"
 #include "absl/log/check.h"
+#include "mlir/lib/Bindings/Python/PybindUtils.h"
 #include "jaxlib/mosaic/dialect/tpu/integrations/c/tpu_dialect.h"
 
 // TODO(tlongeri): Can I add my own return type annotations to functions?
@@ -562,7 +563,24 @@ PYBIND11_MODULE(_tpu_ext, m) {
           "  shape: An optional shape of the vector to which both layouts "
           "apply. More layouts are considered equivalent when the shape is "
           "specified. Also see the docstring of the generalizes method.")
-      .def("__eq__", mlirTpuVectorLayoutEquals);
+      .def("__eq__", mlirTpuVectorLayoutEquals)
+      .def(
+          "__str__",
+          [](MlirTpuVectorLayout self) {
+            mlir::PyPrintAccumulator printAccum;
+            mlirTpuVectorLayoutPrint(self, printAccum.getCallback(),
+                                     printAccum.getUserData());
+            return printAccum.join();
+          })
+      .def("__repr__",
+           [](MlirTpuVectorLayout self) {
+             mlir::PyPrintAccumulator printAccum;
+             printAccum.parts.append("VectorLayout(");
+             mlirTpuVectorLayoutPrint(self, printAccum.getCallback(),
+                                printAccum.getUserData());
+             printAccum.parts.append(")");
+             return printAccum.join();
+           });
 
   // TODO(tlongeri): Can we make the first parameter a VectorType?
   m.def("assemble",
