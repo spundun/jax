@@ -625,6 +625,14 @@ if not TYPE_CHECKING:
   ArrayImpl = use_cpp_class(xc.ArrayImpl)(ArrayImpl)
 
 
+def _get_shape_from_index(slc: Index, shape: Shape) -> Shape:
+  return tuple(
+      (s.stop or dim) - (s.start or 0)
+      for s, dim in safe_zip(slc, shape)
+      if isinstance(s, slice)  # If element is int, this dimension is reduced
+  )
+
+
 # explicitly set to be unhashable.
 setattr(ArrayImpl, "__hash__", None)
 setattr(ArrayImpl, "__array_priority__", 100)
@@ -684,14 +692,30 @@ def make_array_from_callback(
         f"sharding should be an instance of `jax.sharding`. Got {sharding} of"
         f" type {type(sharding)}")
 
+  def get_data(index: Index | None) -> ArrayLike:
+    assert index is not None
+    r = data_callback(index)
+    expected_shape = _get_shape_from_index(index, shape)
+    # Do this check because `batched_device_put` won't do these checks
+    # like ArrayImpl.
+    if expected_shape != np.shape(r):
+      raise ValueError(
+          f"Expected shard shape {expected_shape} doesn't match the single"
+          f" device array shape {np.shape(r)}. Shape of global array is"
+          f" {shape} with sharding {sharding}"
+      )
+    return r
+
   if sharding.is_fully_replicated:
     devices = list(sharding._internal_device_list.addressable_device_list)  # type: ignore
-    per_device_values = [data_callback((slice(None),) * len(shape))] * len(devices)
+    per_device_values = [get_data((slice(None),) * len(shape))] * len(devices)
   else:
     device_to_index_map = sharding.addressable_devices_indices_map(shape)
     devices = list(device_to_index_map.keys())
-    per_device_values = [data_callback(device_to_index_map[device])
-                         for device in devices]
+    print(f"{device_to_index_map=}, {shape}")
+    per_device_values = [
+        get_data(device_to_index_map[device]) for device in devices
+    ]
 
   if isinstance(per_device_values[0], core.Tracer):
     raise errors.UnexpectedTracerError(
@@ -701,15 +725,12 @@ def make_array_from_callback(
   aval = core.ShapedArray(shape, first_value.dtype, weak_type=False)
 
   # first value can be numpy array, python scalar, etc.
-  if (sharding.is_fully_replicated and not isinstance(first_value, ArrayImpl)
-      and not dtypes.issubdtype(aval.dtype, dtypes.extended) and dll is None):
-    # Do this check outside because `batched_device_put` won't do these checks
-    # like ArrayImpl.
-    if shape != first_value.shape:
-      raise ValueError(
-            f"Expected shard shape {shape} doesn't match the single device "
-            f"array shape {first_value.shape}. Shape of Array is "
-            f"{aval.str_short()} with sharding {sharding}")
+  if (
+      sharding.is_fully_replicated
+      and not isinstance(first_value, ArrayImpl)
+      and not dtypes.issubdtype(aval.dtype, dtypes.extended)
+      and dll is None
+  ):
     return pxla.batched_device_put(
         aval, sharding, per_device_values, devices, committed=True)
 
@@ -722,13 +743,27 @@ def make_array_from_callback(
            pxla._maybe_get_default_layout(Layout(dll, sharding), None, sharding, aval))):
     return first_value
 
+  if dtypes.issubdtype(aval.dtype, dtypes.extended):
+    # TODO(yashkatariya): Can this also use batched_device_put?
+    arrays = api.device_put(per_device_values, devices)
+    return aval.dtype._rules.make_sharded_array(
+        aval, sharding, arrays, committed=True
+    )
+
   if dll is not None:
     devices = [Layout(dll, SingleDeviceSharding(d)) for d in devices]
-  arrays = api.device_put(per_device_values, devices)
-  if dtypes.issubdtype(aval.dtype, dtypes.extended):
-    return aval.dtype._rules.make_sharded_array(aval, sharding, arrays,
-                                                committed=True)
-  return ArrayImpl(aval, sharding, arrays, committed=True)
+    # pxla.batched_device_put doesn't support Layout... Take the slow route
+    arrays = api.device_put(per_device_values, devices)
+    return ArrayImpl(aval, sharding, arrays, committed=True)
+
+  v = per_device_values[0]
+
+  if isinstance(v, ArrayImpl) and len(v.devices()) > 1:
+    # The output of the callback is already a sharded array, so move it to
+    # to target device.
+    per_device_values = api.device_put(per_device_values, devices)
+
+  return pxla.batched_device_put(aval, sharding, per_device_values, devices)
 
 
 def make_array_from_process_local_data(
@@ -861,7 +896,6 @@ def make_array_from_process_local_data(
       )
   elif None in global_shape:
     raise ValueError(f"{global_shape=} has Nones. This is not supported.")
-  shard_shape = sharding.shard_shape(global_shape)
   full_dim = []
   for i, (data_dim, global_dim) in enumerate(
       zip(local_data.shape, global_shape)
@@ -877,6 +911,9 @@ def make_array_from_process_local_data(
             f"{global_shape=}."
         )
   addressable_shards = sharding.addressable_devices_indices_map(global_shape)
+  shard = next(iter(addressable_shards.values()))
+  assert shard is not None
+  shard_shape = _get_shape_from_index(shard, global_shape)
   slices_for_each_dim: list[list[int]] = [[] for _ in global_shape]
   for shard_index in addressable_shards.values():
     assert shard_index is not None
@@ -885,19 +922,20 @@ def make_array_from_process_local_data(
   for i in range(len(global_shape)):
     slices_for_each_dim[i] = sorted(set(slices_for_each_dim[i]))
 
-  def local_slice(i, slc):
+  @functools.lru_cache(maxsize=4096)
+  def local_slice(i, start):
     # Looks up the index of this slice in the list of slices for this dimension.
     # This will determine the slice in host_local_data
-    start = slices_for_each_dim[i].index(slc.start or 0) * shard_shape[i]
+    start = slices_for_each_dim[i].index(start or 0) * shard_shape[i]
     end = start + shard_shape[i]
     return slice(start, end)
 
   def cb(index: Index | None) -> ArrayLike:
     assert index is not None
-    data_slice = [
-        slc if full_dim[i] else local_slice(i, slc)
+    data_slice = (
+        slc if full_dim[i] else local_slice(i, slc.start)
         for i, slc in enumerate(index)
-    ]
+    )
     return local_data[tuple(data_slice)]
 
   return make_array_from_callback(global_shape, sharding, cb)
